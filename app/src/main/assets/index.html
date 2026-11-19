@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#160730">
+<title>Goldfish Live Wallpaper</title>
+<style>
+  html, body {
+    margin: 0; height: 100%; overflow: hidden; background: #160730; color: #fff1ea;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent;
+    -webkit-touch-callout: none; touch-action: none;
+  }
+  canvas#sea { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+
+  /* Flat, high-contrast dark glass. A live blur behind this panel would make the WebView re-composite
+     a hardware layer over the animated canvas every frame, which shows up as flicker on mobile GPUs. */
+  .hud {
+    position: fixed; left: 50%; bottom: max(env(safe-area-inset-bottom), 14px);
+    transform: translateX(-50%); width: min(calc(100% - 24px), 520px);
+    padding: 12px; border-radius: 26px;
+    background: rgba(8, 16, 26, 0.86);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+  }
+  .hint { margin: 2px 6px 10px; font-size: 13px; line-height: 1.35; text-align: center; opacity: 0.82; }
+  .seg {
+    position: relative; display: grid; grid-template-columns: 1fr 1fr; padding: 4px;
+    border-radius: 999px; background: rgba(255, 255, 255, 0.08);
+  }
+  .seg button {
+    height: 42px; border: 0; border-radius: 999px; background: none; color: #fff1ea;
+    font: 600 14px/1 inherit;
+  }
+  .seg button[aria-pressed="true"] { background: linear-gradient(135deg, #f9d3c3, #e9a496); color: #2a0f3a; }
+  body[data-mode="pond"] .seg button[aria-pressed="true"] { background: linear-gradient(135deg, #c6f7f1, #72d9d6); color: #032a33; }
+  .row { display: flex; gap: 10px; margin-top: 10px; }
+  .btn { height: 54px; border: 0; border-radius: 18px; font: 650 16px/1 inherit; color: #fff1ea; }
+  .btn.feed { flex: 0 0 auto; padding: 0 20px; background: rgba(255, 255, 255, 0.12); border: 1px solid rgba(255, 255, 255, 0.16); }
+  .btn.set { flex: 1; color: #2a0f3a; background: linear-gradient(135deg, #f9d3c3, #e9a496 55%, #cf8190); }
+  body[data-mode="pond"] .btn.set { color: #032a33; background: linear-gradient(135deg, #c6f7f1, #72d9d6 55%, #3bb0bb); }
+  .btn:active { opacity: 0.85; }
+  button:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+  #toast {
+    position: fixed; left: 50%; bottom: calc(max(env(safe-area-inset-bottom), 14px) + 196px);
+    transform: translateX(-50%); max-width: calc(100% - 40px); padding: 10px 16px; border-radius: 999px;
+    background: rgba(8, 16, 26, 0.92); font-size: 13px; text-align: center; opacity: 0; pointer-events: none;
+  }
+  #toast.show { opacity: 1; }
+</style>
+</head>
+<body data-mode="love">
+<canvas id="sea" aria-label="Animated goldfish aquarium"></canvas>
+
+<section class="hud">
+  <p class="hint">Tap or drag to make water ripples. Double-tap to feed the fish.</p>
+  <div class="seg" id="seg" role="group" aria-label="Aquarium theme">
+    <button type="button" data-mode="pond" aria-pressed="false">Natural Pond</button>
+    <button type="button" data-mode="love" aria-pressed="true">Love Aquarium</button>
+  </div>
+  <div class="row">
+    <button type="button" class="btn feed" id="feed">Feed Fish</button>
+    <button type="button" class="btn set" id="set">Set Live Wallpaper</button>
+  </div>
+</section>
+<div id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function () {
+'use strict';
+
+/* ======================================================================
+ *  Goldfish aquarium preview (Canvas 2D). Mirrors AquariumScene.java.
+ *  The frame loop allocates nothing: no gradients, no paths, no strings.
+ *  Gradients live in pre-rendered sprites / cached objects built at start-up or resize.
+ * ==================================================================== */
+var PI = Math.PI, TAU = PI * 2;
+var N = 12, FISH_COUNT = 8, RAYS = 7, LINKS = 6, MAX_RIPPLES = 25, MAX_PELLETS = 48, MAX_BUBBLES = 30;
+
+var WIDTH = [0.50, 0.82, 0.98, 1.00, 0.92, 0.79, 0.64, 0.50, 0.38, 0.28, 0.21, 0.16];
+var RAY_LEN = [0.62, 0.92, 1.00, 0.52, 1.00, 0.92, 0.62];
+var K_BASE = [0.50, 0.42, 0.34, 0.27, 0.22, 0.18];
+var BODY_STOPS = [0, 0.32, 0.70, 0.93, 1];
+var BODY = [
+  [0xFFFFE9A8, 0xFFFFB52E, 0xFFFF8A00, 0xFFD25400, 0x00B03A00],
+  [0xFFFFC9A0, 0xFFFF8142, 0xFFF04E12, 0xFFB5300A, 0x009A2400],
+  [0xFFFFFFFF, 0xFFFFF1E2, 0xFFFFDCC0, 0xFFE9B08C, 0x00D08A60],
+  [0xFFFFFFFF, 0xFFFFF4EE, 0xFFFFE3DB, 0xFFF0B5B0, 0x00D88A8A]
+];
+var EDGE = [0xC24A00, 0x9E2C08, 0xD39A78, 0xD9A09B];
+var FIN = [0xFFA340, 0xFF6A2E, 0xFFC9A0, 0xFFB8B0];
+var FIN2 = [0xFFC870, 0xFF9A62, 0xFFE9D6, 0xFFE0DA];
+var PALETTE_PLAN = [0, 3, 1, 0, 2, 1, 0, 2];
+var PEBBLES_POND = [0x8A8270, 0x6E6A5C, 0x9C927A, 0x5C5A52, 0x7A7462];
+var PEBBLES_LOVE = [0xB5798F, 0x8E6AA8, 0xD9B5C4, 0x9A6C86, 0x6F5A88];
+
+var canvas = document.getElementById('sea');
+var ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
+
+/* ---------- helpers ---------- */
+function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
+function wrapAngle(a) { while (a > PI) a -= TAU; while (a < -PI) a += TAU; return a; }
+var seed = 1234;
+function rnd() {
+  seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+  var t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+  t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+  return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+}
+function rand(lo, hi) { return lo + rnd() * (hi - lo); }
+function css(v) {
+  var a = ((v >>> 24) & 255) / 255, r = (v >> 16) & 255, g = (v >> 8) & 255, b = v & 255;
+  return 'rgba(' + r + ',' + g + ',' + b + ',' + a.toFixed(3) + ')';
+}
+var colCache = new Map();             // numeric key -> string; after warm-up a lookup allocates nothing
+function col(rgb, alpha) {
+  var k = (rgb & 0xFFFFFF) * 256 + alpha, s = colCache.get(k);
+  if (!s) { s = css(((alpha << 24) | (rgb & 0xFFFFFF)) >>> 0); colCache.set(k, s); }
+  return s;
+}
+function makeCanvas(w, h) { var c = document.createElement('canvas'); c.width = Math.max(1, w | 0); c.height = Math.max(1, h | 0); return c; }
+function lighten(c, t) { var r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255; return 0xFF000000 | ((r + (255 - r) * t) << 16) | ((g + (255 - g) * t) << 8) | (b + (255 - b) * t); }
+function darken(c, t) { var r = (c >> 16) & 255, g = (c >> 8) & 255, b = c & 255; return 0xFF000000 | ((r * (1 - t)) << 16) | ((g * (1 - t)) << 8) | (b * (1 - t)); }
+
+/* ---------- display ---------- */
+var W = 1, H = 1, unit = 400, dens = 1, DPR = 1, quality = 1, CW = 2, CH = 2;
+var loveMode = true, time = 0, ambientRipple = 3;
+
+/* ---------- sprites: all gradient shading is rendered once ---------- */
+function makeSprite(size, draw) { var c = makeCanvas(size, size); draw(c.getContext('2d'), size); return c; }
+function radialSprite(stops, colors, size, cx, cy, rad) {
+  return makeSprite(size, function (g, s) {
+    var r = s / 2, gr = g.createRadialGradient(r + cx * r, r + cy * r, 0, r + cx * r, r + cy * r, rad * r);
+    for (var i = 0; i < colors.length; i++) gr.addColorStop(stops[i], css(colors[i]));
+    g.fillStyle = gr; g.beginPath(); g.arc(r, r, r, 0, TAU); g.fill();
+  });
+}
+var bodySprite = BODY.map(function (c) { return radialSprite(BODY_STOPS, c, 128, -0.26, -0.32, 1.30); });
+var blotchSprite = [
+  radialSprite([0, 0.6, 1], [0xFFFF7A1A, 0xF0FF6A10, 0x00FF5A00], 128, 0, 0, 1),
+  radialSprite([0, 0.6, 1], [0xFFE8271B, 0xF0D81E14, 0x00C81810], 128, 0, 0, 1)
+];
+var pelletSprite = radialSprite([0, 0.55, 1], [0xFFFFE3A6, 0xFFD9892B, 0xFF7C4210], 64, -0.30, -0.30, 1.35);
+var eyeSprite = EDGE.map(function (edge) {
+  return makeSprite(64, function (g, s) {
+    var r = s / 2, u = r / 1.35;
+    g.fillStyle = col(edge, 190); g.beginPath(); g.arc(r, r, r, 0, TAU); g.fill();
+    g.fillStyle = '#140a10'; g.beginPath(); g.arc(r, r, u, 0, TAU); g.fill();
+    g.strokeStyle = '#e0a030'; g.lineWidth = u * 0.22; g.beginPath(); g.arc(r, r, u * 0.92, 0, TAU); g.stroke();
+    g.fillStyle = 'rgba(255,255,255,0.94)'; g.beginPath(); g.arc(r - u * 0.32, r - u * 0.38, u * 0.30, 0, TAU); g.fill();
+  });
+});
+
+/* ---------- backdrop: gradient, sand, soft-shadowed pebbles (one bitmap per theme) ---------- */
+var backdrops = { love: null, pond: null }, overlay = null, beamGrad = null, causticPattern = { love: null, pond: null };
+
+function buildBackdrop(love) {
+  var w = CW0(), h = CH0(), cv = makeCanvas(w, h), c = cv.getContext('2d'), r = mulberry(77);
+  var bg = love ? [0xFF160730, 0xFF33124F, 0xFF5E2060, 0xFF8C3A6B] : [0xFF012A33, 0xFF04515E, 0xFF07757F, 0xFF0C9DA3];
+  var glow = love ? [0x5CFF9EC8, 0x00FF9EC8] : [0x5078F0E8, 0x0078F0E8];
+  var lg = c.createLinearGradient(0, 0, 0, h), stops = [0, 0.45, 0.8, 1], i;
+  for (i = 0; i < 4; i++) lg.addColorStop(stops[i], css(bg[i]));
+  c.fillStyle = lg; c.fillRect(0, 0, w, h);
+  var rg = c.createRadialGradient(w * 0.5, -h * 0.04, 0, w * 0.5, -h * 0.04, h * 0.85);
+  rg.addColorStop(0, css(glow[0])); rg.addColorStop(1, css(glow[1]));
+  c.fillStyle = rg; c.fillRect(0, 0, w, h);
+
+  var u = Math.min(w, h), specks = Math.floor(w * h / 2600);
+  for (i = 0; i < specks; i++) {                                      // sand grain
+    c.fillStyle = r() < 0.5 ? 'rgba(255,255,255,' + (0.04 + r() * 0.10).toFixed(3) + ')' : 'rgba(0,0,0,' + (0.04 + r() * 0.10).toFixed(3) + ')';
+    c.beginPath(); c.arc(r() * w, r() * h, 0.6 + r() * 1.2, 0, TAU); c.fill();
+  }
+  var pal = love ? PEBBLES_LOVE : PEBBLES_POND, count = Math.max(30, Math.floor(w * h / (u * u * 0.030)));
+  for (i = 0; i < count; i++) {                                       // pebbles with soft drop shadows
+    var rx = u * (0.012 + 0.050 * r() * r()), ry = rx * (0.60 + 0.30 * r()), base = 0xFF000000 | pal[Math.floor(r() * pal.length)];
+    c.save(); c.translate(r() * w, r() * h); c.rotate(r() * PI);
+    c.shadowColor = 'rgba(0,0,16,0.42)'; c.shadowBlur = Math.max(2, rx * 0.8); c.shadowOffsetX = rx * 0.25; c.shadowOffsetY = rx * 0.45;
+    c.fillStyle = css(base); c.beginPath(); c.ellipse(0, 0, rx, ry, 0, 0, TAU); c.fill();
+    c.shadowColor = 'transparent'; c.shadowBlur = 0;
+    var pg = c.createRadialGradient(-rx * 0.35, -ry * 0.40, 0, -rx * 0.35, -ry * 0.40, rx * 1.5);
+    pg.addColorStop(0, css(lighten(base, 0.35))); pg.addColorStop(0.55, css(base)); pg.addColorStop(1, css(darken(base, 0.55)));
+    c.fillStyle = pg; c.beginPath(); c.ellipse(0, 0, rx, ry, 0, 0, TAU); c.fill();
+    c.fillStyle = 'rgba(255,255,255,0.33)'; c.beginPath(); c.ellipse(-rx * 0.30, -ry * 0.42, rx * 0.25, ry * 0.20, 0, 0, TAU); c.fill();
+    c.restore();
+  }
+  return cv;
+}
+function mulberry(a) {
+  return function () { a |= 0; a = (a + 0x6D2B79F5) | 0; var t = Math.imul(a ^ (a >>> 15), 1 | a); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+function CW0() { return Math.max(2, Math.round(W * DPR)); }
+function CH0() { return Math.max(2, Math.round(H * DPR)); }
+
+function buildCausticPattern(love) {
+  var s = 160, tile = makeCanvas(s, s), tc = tile.getContext('2d'), img = tc.createImageData(s, s), d = img.data;
+  var r = love ? 255 : 205, g = love ? 190 : 255, b = love ? 222 : 255;
+  for (var y = 0; y < s; y++) {
+    for (var x = 0; x < s; x++) {
+      var u = x / s * TAU, v = y / s * TAU;
+      var a = Math.sin(u * 2 + 1.4 * Math.sin(v * 3 + 0.6)), bb = Math.sin(v * 2 + 1.4 * Math.sin(u * 3 + 2.1)), cc = Math.sin(u + v + 1.2 * Math.sin(u * 2 - v * 2));
+      var ln = 1 - Math.abs((a + bb + cc) / 3) / 0.12;
+      if (ln < 0) ln = 0;
+      ln = ln * Math.sqrt(ln);
+      var o = (y * s + x) * 4;
+      d[o] = r; d[o + 1] = g; d[o + 2] = b; d[o + 3] = Math.floor(ln * 255);
+    }
+  }
+  tc.putImageData(img, 0, 0);
+  return ctx.createPattern(tile, 'repeat');
+}
+
+function buildOverlay() {
+  var w = CW0(), h = CH0(), cv = makeCanvas(w, h), c = cv.getContext('2d');
+  var dg = c.createLinearGradient(0, 0, 0, h); dg.addColorStop(0, 'rgba(0,0,0,0)'); dg.addColorStop(1, 'rgba(0,0,24,0.227)');
+  c.fillStyle = dg; c.fillRect(0, 0, w, h);
+  var diag = Math.sqrt(w * w + h * h), vg = c.createRadialGradient(w / 2, h / 2, 0, w / 2, h / 2, diag * 0.62);
+  vg.addColorStop(0, 'rgba(0,0,0,0)'); vg.addColorStop(0.5, 'rgba(0,0,0,0)'); vg.addColorStop(1, 'rgba(0,0,20,0.455)');
+  c.fillStyle = vg; c.fillRect(0, 0, w, h);
+  return cv;
+}
+
+/* ---------- model ---------- */
+function F(n) { return new Float32Array(n); }
+function makeTail(length, spread, phase) { return { px: F(RAYS * (LINKS + 1)), py: F(RAYS * (LINKS + 1)), length: length, spread: spread, phase: phase }; }
+function makeFish() {
+  return {
+    x: 0, y: 0, ang: 0, speed: 0, len: 100, cruise: 50, sn: 0,
+    phase: 0, pecPhaseL: 0, pecPhaseR: 0, pelPhaseL: 0, pelPhaseR: 0,
+    dart: 0, dartAng: 0, attractT: 0, attractX: 0, attractY: 0, tx: 0, ty: 0, retarget: 0,
+    palette: 0, pairIdx: 0, slot: 0,
+    sx: F(N), sy: F(N), rx: F(N), ry: F(N), dx: F(N), dy: F(N), hw: F(N),
+    bj: [0, 0, 0], bo: [0, 0, 0], bs: [0, 0, 0], bc: [0, 0, 0], blotches: 0,
+    tailA: makeTail(0.80, 0.30, 0), tailB: makeTail(0.56, 0.25, 1.3),
+    bodyX: F(2 * N + 4), bodyY: F(2 * N + 4), bodyM: 0,
+    dorX: F(2 * N + 4), dorY: F(2 * N + 4), dorM: 0,
+    spX: F(2 * N + 4), spY: F(2 * N + 4), spM: 0
+  };
+}
+var fish = [], pairs = [], ripples = [], pellets = [], bubbles = [], linkK = F(LINKS), i0;
+for (i0 = 0; i0 < FISH_COUNT; i0++) fish.push(makeFish());
+for (i0 = 0; i0 < FISH_COUNT / 2; i0++) pairs.push({ cx: 0, cy: 0, ang: 0, speed: 0, tx: 0, ty: 0, retarget: 0, phi: 0, phiSpeed: 0, d: 0, e: 0, seed: 0 });
+for (i0 = 0; i0 < MAX_RIPPLES; i0++) ripples.push({ active: false, x: 0, y: 0, maxR: 0, age: 0, life: 1 });
+for (i0 = 0; i0 < MAX_PELLETS; i0++) pellets.push({ on: false, x: 0, y: 0, vy: 0, phase: 0, life: 0 });
+for (i0 = 0; i0 < MAX_BUBBLES; i0++) bubbles.push({ x: 0, y: 0, r: 1, vy: 0, phase: 0 });
+
+var tX = F(N), tY = F(N), tW = F(N), uX = F(N), uY = F(N), oX = F(2 * N + 4), oY = F(2 * N + 4);
+
+function startRipple(x, y, maxR, life, delay) {
+  for (var i = 0; i < MAX_RIPPLES; i++) {
+    var r = ripples[i];
+    if (!r.active) { r.x = x; r.y = y; r.maxR = maxR; r.life = life; r.age = delay; r.active = true; return; }
+  }
+}
+function pickTarget(f) {
+  var mx = Math.min(f.len * 0.9, W * 0.4), my = Math.min(f.len * 0.9, H * 0.4);
+  f.tx = rand(mx, W - mx); f.ty = rand(my, H - my); f.retarget = rand(5, 11);
+}
+function pickPairTarget(p) {
+  var mx = Math.min(unit * 0.22, W * 0.4), my = Math.min(unit * 0.22, H * 0.4);
+  p.tx = rand(mx, W - mx); p.ty = rand(my, H - my); p.retarget = rand(8, 16);
+}
+
+function initFish() {
+  var base = unit * 0.235, k, i, j;
+  for (k = 0; k < pairs.length; k++) {
+    var q = pairs[k];
+    q.cx = W * rand(0.28, 0.72); q.cy = H * (0.16 + 0.22 * k + rand(-0.03, 0.03));
+    q.ang = rand(0, TAU); q.phi = rand(0, TAU); q.phiSpeed = rand(0.45, 0.70); q.seed = rand(0, 10);
+  }
+  for (i = 0; i < FISH_COUNT; i++) {
+    var f = fish[i];
+    f.pairIdx = (i / 2) | 0; f.slot = i % 2;
+    f.len = base * (f.slot === 0 ? rand(0.86, 1.18) : fish[i - 1].len / base * rand(0.88, 1.0));
+    f.palette = PALETTE_PLAN[i];
+    f.cruise = f.len * rand(0.40, 0.62); f.speed = f.cruise;
+    f.phase = rand(0, TAU); f.pecPhaseL = rand(0, TAU); f.pecPhaseR = rand(0, TAU); f.pelPhaseL = rand(0, TAU); f.pelPhaseR = rand(0, TAU);
+    f.dart = 0; f.attractT = 0;
+    for (j = 0; j < N; j++) f.hw[j] = WIDTH[j] * f.len * 0.205;
+    f.blotches = 0;
+    if (f.palette === 2) {
+      f.blotches = 3;
+      f.bj[0] = rand(1.1, 2.0); f.bo[0] = rand(-0.3, 0.3); f.bs[0] = rand(0.85, 1.15); f.bc[0] = 1;
+      f.bj[1] = rand(3.7, 4.7); f.bo[1] = rand(-0.35, 0.35); f.bs[1] = rand(0.85, 1.2); f.bc[1] = 0;
+      f.bj[2] = rand(6.3, 7.6); f.bo[2] = rand(-0.3, 0.3); f.bs[2] = rand(0.8, 1.1); f.bc[2] = 0;
+    } else if (f.palette === 3) { f.blotches = 1; f.bj[0] = 1.3; f.bo[0] = 0; f.bs[0] = 1.0; f.bc[0] = 1; }
+    var p = pairs[f.pairIdx], sgn = f.slot === 0 ? 1 : -1;
+    f.ang = p.ang;
+    f.x = p.cx - Math.sin(p.ang) * f.len * 0.55 * sgn; f.y = p.cy + Math.cos(p.ang) * f.len * 0.55 * sgn;
+    f.sn = 0.5;
+    var seg = f.len / (N - 1);
+    for (j = 0; j < N; j++) { f.sx[j] = f.x - Math.cos(f.ang) * seg * j; f.sy[j] = f.y - Math.sin(f.ang) * seg * j; }
+    pickTarget(f); solveSpine(f); resetTail(f, f.tailA); resetTail(f, f.tailB); buildGeometry(f);
+  }
+  var avg = 0;
+  for (i = 0; i < FISH_COUNT; i++) avg += fish[i].len;
+  avg /= FISH_COUNT;
+  for (k = 0; k < pairs.length; k++) { pairs[k].speed = avg * 0.34; pairs[k].d = avg * 0.52; pairs[k].e = avg * 0.62; pickPairTarget(pairs[k]); }
+}
+function initBubbles() {
+  for (var i = 0; i < MAX_BUBBLES; i++) { var b = bubbles[i]; b.x = rand(0, W); b.y = rand(0, H); b.r = dens * rand(1.5, 5); b.vy = unit * rand(0.025, 0.075); b.phase = rand(0, TAU); }
+}
+
+/* ---------- simulation ---------- */
+function updatePair(p, k, dt) {
+  p.retarget -= dt;
+  var ddx = p.tx - p.cx, ddy = p.ty - p.cy, reach = unit * 0.12;
+  if (p.retarget <= 0 || ddx * ddx + ddy * ddy < reach * reach) { pickPairTarget(p); ddx = p.tx - p.cx; ddy = p.ty - p.cy; }
+  var d = Math.sqrt(ddx * ddx + ddy * ddy), vx = d > 1e-3 ? ddx / d : 0, vy = d > 1e-3 ? ddy / d : 0, m = unit * 0.20;
+  if (p.cx < m) vx += 2.2 * (m - p.cx) / m; else if (p.cx > W - m) vx -= 2.2 * (p.cx - (W - m)) / m;
+  if (p.cy < m) vy += 2.2 * (m - p.cy) / m; else if (p.cy > H - m) vy -= 2.2 * (p.cy - (H - m)) / m;
+  var diff = wrapAngle(Math.atan2(vy, vx) - p.ang), maxTurn = 0.5 * dt;
+  p.ang += clamp(diff, -maxTurn, maxTurn);
+  p.cx += Math.cos(p.ang) * p.speed * dt; p.cy += Math.sin(p.ang) * p.speed * dt;
+  var a = fish[2 * k], b = fish[2 * k + 1], sx = (a.x + b.x) * 0.5 - p.cx, sy = (a.y + b.y) * 0.5 - p.cy, far = (a.len + b.len) * 0.8;
+  if (sx * sx + sy * sy > far * far) { p.cx += sx * 0.6 * dt; p.cy += sy * 0.6 * dt; }
+  p.phi += dt * p.phiSpeed * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(time * 0.23 + p.seed)));
+}
+function aimAt(f, tx, ty, wallK) {
+  var vx = tx - f.x, vy = ty - f.y, d = Math.sqrt(vx * vx + vy * vy);
+  if (d > 1e-3) { vx /= d; vy /= d; }
+  var m = f.len * 0.8;
+  if (f.x < m) vx += 2.2 * wallK * (m - f.x) / m; else if (f.x > W - m) vx -= 2.2 * wallK * (f.x - (W - m)) / m;
+  if (f.y < m) vy += 2.2 * wallK * (m - f.y) / m; else if (f.y > H - m) vy -= 2.2 * wallK * (f.y - (H - m)) / m;
+  return Math.atan2(vy, vx);
+}
+function nearestPellet(f) {
+  var best = -1, bd = unit * unit * 0.9;
+  for (var i = 0; i < MAX_PELLETS; i++) {
+    var pl = pellets[i];
+    if (!pl.on) continue;
+    var dx = pl.x - f.x, dy = pl.y - f.y, d = dx * dx + dy * dy;
+    if (d < bd) { bd = d; best = i; }
+  }
+  return best;
+}
+function steer(f, dt) {
+  var desiredSpeed = f.cruise, aim, turnBoost = 1, fleeing = f.dart > 0, pi = fleeing ? -1 : nearestPellet(f);
+  if (fleeing) { f.dart -= dt; aim = f.dartAng; desiredSpeed = f.len * 2.1; turnBoost = 2.4; }
+  else if (pi >= 0) {
+    var pl = pellets[pi];
+    aim = aimAt(f, pl.x, pl.y, 0.25); desiredSpeed = f.len * 0.95;
+    var qx = pl.x - f.x, qy = pl.y - f.y, d2 = qx * qx + qy * qy, eatR = f.len * 0.17;
+    if (d2 < eatR * eatR) { pl.on = false; startRipple(pl.x, pl.y, unit * 0.07, 0.9, 0); }
+    else if (d2 < f.len * f.len) desiredSpeed = f.len * 0.45;
+  } else if (f.attractT > 0) {
+    f.attractT -= dt; aim = aimAt(f, f.attractX, f.attractY, 0.8); desiredSpeed = f.len * 0.70;
+    var ax = f.attractX - f.x, ay = f.attractY - f.y;
+    if (ax * ax + ay * ay < f.len * f.len * 0.5) f.attractT = 0;
+  } else if (loveMode) {
+    var p = pairs[f.pairIdx], fx = Math.cos(p.ang), fy = Math.sin(p.ang), sgn = f.slot === 0 ? 1 : -1, sp = Math.sin(p.phi), cp = Math.cos(p.phi);
+    var tx = p.cx + (fx * p.e * sp - fy * p.d * cp) * sgn, ty = p.cy + (fy * p.e * sp + fx * p.d * cp) * sgn;
+    var ex = tx - f.x, ey = ty - f.y, dist = Math.sqrt(ex * ex + ey * ey), toTarget = aimAt(f, tx, ty, 0.6), align = clamp(1 - dist / (f.len * 0.9), 0, 0.85);
+    aim = toTarget + wrapAngle(p.ang - toTarget) * align;
+    desiredSpeed = clamp(p.speed + dist * 1.4, f.len * 0.22, f.len * 1.15);
+  } else {
+    f.retarget -= dt;
+    var wx = f.tx - f.x, wy = f.ty - f.y, reach = f.len * 0.9;
+    if (f.retarget <= 0 || wx * wx + wy * wy < reach * reach) pickTarget(f);
+    aim = aimAt(f, f.tx, f.ty, 1);
+    desiredSpeed = f.cruise * (0.85 + 0.3 * Math.sin(time * 0.5 + f.len));
+  }
+  var diff = wrapAngle(aim - f.ang), maxTurn = clamp(f.speed / (f.len * 0.42), 0.9, 4.0) * turnBoost * dt;
+  f.ang += clamp(diff, -maxTurn, maxTurn);
+  if (!fleeing) desiredSpeed *= 0.62 + 0.38 * Math.max(0, Math.cos(diff));
+  f.speed += (desiredSpeed - f.speed) * (1 - Math.exp(-(fleeing ? 7 : 1.8) * dt));
+  f.x += Math.cos(f.ang) * f.speed * dt; f.y += Math.sin(f.ang) * f.speed * dt;
+  var lim = f.len * 0.3;
+  f.x = clamp(f.x, -lim, W + lim); f.y = clamp(f.y, -lim, H + lim);
+  f.sn = clamp(f.speed / (f.len * 1.1), 0, 1.6);
+  f.phase += dt * TAU * (0.55 + 1.55 * f.sn);
+  f.pecPhaseL += dt * TAU * (1.10 + 0.70 * f.sn); f.pecPhaseR += dt * TAU * (0.93 + 0.80 * f.sn);
+  f.pelPhaseL += dt * TAU * (0.70 + 0.40 * f.sn); f.pelPhaseR += dt * TAU * (0.82 + 0.35 * f.sn);
+}
+function scare(x, y) {
+  for (var k = 0; k < FISH_COUNT; k++) {
+    var f = fish[k];
+    if (f.dart > 0.2) continue;
+    var best = Infinity;
+    for (var i = 0; i < N; i += 3) { var dx = f.sx[i] - x, dy = f.sy[i] - y, dd = dx * dx + dy * dy; if (dd < best) best = dd; }
+    var r = f.len * 0.42;
+    if (best < r * r) { f.dart = rand(0.6, 0.95); f.dartAng = Math.atan2(f.y - y, f.x - x) + rand(-0.5, 0.5); f.attractT = 0; }
+  }
+}
+function solveSpine(f) {
+  var seg = f.len / (N - 1), i, a, b, dx, dy, d;
+  f.sx[0] = f.x; f.sy[0] = f.y;
+  for (i = 1; i < N; i++) {
+    dx = f.sx[i] - f.sx[i - 1]; dy = f.sy[i] - f.sy[i - 1]; d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-4) { dx = -Math.cos(f.ang); dy = -Math.sin(f.ang); d = 1; }
+    var k = seg / d; f.sx[i] = f.sx[i - 1] + dx * k; f.sy[i] = f.sy[i - 1] + dy * k;
+  }
+  for (i = 0; i < N; i++) {
+    a = i === 0 ? 0 : i - 1; b = i === N - 1 ? N - 1 : i + 1;
+    dx = f.sx[a] - f.sx[b]; dy = f.sy[a] - f.sy[b]; d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-4) { dx = Math.cos(f.ang); dy = Math.sin(f.ang); d = 1; }
+    uX[i] = dx / d; uY[i] = dy / d;
+  }
+  var amp = f.len * 0.075 * (0.28 + 0.72 * Math.min(1, f.sn));
+  for (i = 0; i < N; i++) {
+    var t = i / (N - 1), off = amp * (0.10 + 0.90 * t * t) * Math.sin(f.phase - i * 0.496);
+    f.rx[i] = f.sx[i] - uY[i] * off; f.ry[i] = f.sy[i] + uX[i] * off;
+  }
+  for (i = 0; i < N; i++) {
+    a = i === 0 ? 0 : i - 1; b = i === N - 1 ? N - 1 : i + 1;
+    dx = f.rx[a] - f.rx[b]; dy = f.ry[a] - f.ry[b]; d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-4) { dx = uX[i]; dy = uY[i]; d = 1; }
+    f.dx[i] = dx / d; f.dy[i] = dy / d;
+  }
+}
+function resetTail(f, t) {
+  var S = LINKS + 1, baseAng = Math.atan2(-f.dy[N - 1], -f.dx[N - 1]), tailLen = f.len * t.length;
+  for (var r = 0; r < RAYS; r++) {
+    var restA = baseAng + (r - (RAYS - 1) * 0.5) * t.spread, linkLen = tailLen / LINKS * RAY_LEN[r], o = r * S;
+    t.px[o] = f.rx[N - 1]; t.py[o] = f.ry[N - 1];
+    for (var j = 1; j <= LINKS; j++) { t.px[o + j] = t.px[o + j - 1] + Math.cos(restA) * linkLen; t.py[o + j] = t.py[o + j - 1] + Math.sin(restA) * linkLen; }
+  }
+}
+function updateTail(f, t) {
+  var S = LINKS + 1, rootX = f.rx[N - 1], rootY = f.ry[N - 1], baseAng = Math.atan2(rootY - f.ry[N - 2], rootX - f.rx[N - 2]);
+  var tailLen = f.len * t.length, flutAmp = 0.10 + 0.20 * Math.min(f.sn, 1.2);
+  for (var r = 0; r < RAYS; r++) {
+    var restA = baseAng + (r - (RAYS - 1) * 0.5) * t.spread, linkLen = tailLen / LINKS * RAY_LEN[r], o = r * S;
+    t.px[o] = rootX; t.py[o] = rootY;
+    for (var j = 1; j <= LINKS; j++) {
+      var idx = o + j, vx = t.px[idx] - t.px[idx - 1], vy = t.py[idx] - t.py[idx - 1], vl = Math.sqrt(vx * vx + vy * vy);
+      if (vl < 1e-3) { vx = Math.cos(restA); vy = Math.sin(restA); } else { vx /= vl; vy /= vl; }
+      var jf = j / LINKS;
+      var fl = Math.sin(f.phase - j * 0.85 + r * 0.45 + t.phase) * flutAmp * jf + Math.sin(time * 1.7 + r * 0.9 + j * 0.6 + t.phase) * 0.05 * jf;
+      var ra = restA + fl, k = linkK[j - 1];
+      vx += (Math.cos(ra) - vx) * k; vy += (Math.sin(ra) - vy) * k;
+      var nl = Math.sqrt(vx * vx + vy * vy);
+      if (nl < 1e-4) { vx = Math.cos(ra); vy = Math.sin(ra); nl = 1; }
+      t.px[idx] = t.px[idx - 1] + vx / nl * linkLen; t.py[idx] = t.py[idx - 1] + vy / nl * linkLen;
+    }
+  }
+}
+/* ribbon outline points into caller-owned arrays; returns the point count */
+function ribbonPts(xs, ys, ws, n, noseExt, tailExt, ox, oy) {
+  var i, m = 0;
+  for (i = 0; i < n; i++) {
+    var a = i === 0 ? 0 : i - 1, b = i === n - 1 ? n - 1 : i + 1, dx = xs[a] - xs[b], dy = ys[a] - ys[b], d = Math.sqrt(dx * dx + dy * dy);
+    if (d < 1e-4) { dx = 1; dy = 0; d = 1; }
+    uX[i] = dx / d; uY[i] = dy / d;
+  }
+  ox[m] = xs[0] + uX[0] * noseExt; oy[m] = ys[0] + uY[0] * noseExt; m++;
+  for (i = 0; i < n; i++) { ox[m] = xs[i] - uY[i] * ws[i]; oy[m] = ys[i] + uX[i] * ws[i]; m++; }
+  ox[m] = xs[n - 1] - uX[n - 1] * tailExt; oy[m] = ys[n - 1] - uY[n - 1] * tailExt; m++;
+  for (i = n - 1; i >= 0; i--) { ox[m] = xs[i] + uY[i] * ws[i]; oy[m] = ys[i] - uX[i] * ws[i]; m++; }
+  return m;
+}
+function buildGeometry(f) {
+  var i, k;
+  for (i = 0; i < N; i++) { tX[i] = f.rx[i]; tY[i] = f.ry[i]; tW[i] = f.hw[i] * 1.06; }
+  f.bodyM = ribbonPts(tX, tY, tW, N, f.hw[0] * 0.85, f.hw[N - 1] * 0.5, f.bodyX, f.bodyY);
+  var dn = 7;
+  for (k = 0; k < dn; k++) {
+    i = 3 + k;
+    var sway = Math.sin(time * 2.0 * (0.6 + f.sn) - i * 0.7) * f.hw[i] * 0.28 * (k / (dn - 1) + 0.2);
+    tX[k] = f.rx[i] - f.dy[i] * sway; tY[k] = f.ry[i] + f.dx[i] * sway; tW[k] = f.hw[i] * (0.06 + 0.16 * Math.sin(PI * (k + 0.5) / dn));
+  }
+  f.dorM = ribbonPts(tX, tY, tW, dn, 0, 0, f.dorX, f.dorY);
+  var sn = 8;
+  for (k = 0; k < sn; k++) { i = k + 1; tX[k] = f.rx[i] - 0.30 * f.hw[i]; tY[k] = f.ry[i] - 0.42 * f.hw[i]; tW[k] = f.hw[i] * 0.17 * Math.sin(PI * (k + 0.7) / (sn + 0.7)); }
+  f.spM = ribbonPts(tX, tY, tW, sn, 0, 0, f.spX, f.spY);
+}
+function update(dt, dtScale) {
+  time += dt;
+  var j, i;
+  for (j = 0; j < LINKS; j++) linkK[j] = 1 - Math.pow(1 - K_BASE[j], dtScale);
+  if (loveMode) for (i = 0; i < pairs.length; i++) updatePair(pairs[i], i, dt);
+  if (touching) scare(touchX, touchY);
+  for (i = 0; i < FISH_COUNT; i++) {
+    var f = fish[i];
+    steer(f, dt); solveSpine(f); updateTail(f, f.tailA); updateTail(f, f.tailB); buildGeometry(f);
+  }
+  var floor = H - unit * 0.08;
+  for (i = 0; i < MAX_PELLETS; i++) {
+    var p = pellets[i];
+    if (!p.on) continue;
+    p.life -= dt;
+    if (p.life <= 0) { p.on = false; continue; }
+    if (p.y < floor) p.y += p.vy * dt; else p.life -= dt * 1.5;
+    p.x += Math.sin(time * 2 + p.phase) * unit * 0.010 * dt * 8;
+  }
+  for (i = 0; i < MAX_RIPPLES; i++) { var r = ripples[i]; if (r.active) { r.age += dt; if (r.age >= r.life) r.active = false; } }
+  for (i = 0; i < MAX_BUBBLES; i++) {
+    var b = bubbles[i];
+    b.y -= b.vy * dt; b.x += Math.sin(time * 1.3 + b.phase) * dens * 7 * dt;
+    if (b.y < -b.r * 2) { b.y = H + b.r * 2; b.x = rand(0, W); }
+  }
+  ambientRipple -= dt;
+  if (ambientRipple <= 0) { ambientRipple = rand(3.5, 8); startRipple(rand(0.1, 0.9) * W, rand(0.1, 0.9) * H, unit * rand(0.10, 0.18), 2.2, 0); }
+}
+
+/* ---------- rendering (allocation free) ---------- */
+function emitRibbon(c, ox, oy, m, offx, offy) {
+  c.beginPath();
+  c.moveTo((ox[m - 1] + ox[0]) * 0.5 + offx, (oy[m - 1] + oy[0]) * 0.5 + offy);
+  for (var k = 0; k < m; k++) {
+    var k2 = (k + 1) % m;
+    c.quadraticCurveTo(ox[k] + offx, oy[k] + offy, (ox[k] + ox[k2]) * 0.5 + offx, (oy[k] + oy[k2]) * 0.5 + offy);
+  }
+  c.closePath();
+}
+function emitTail(c, t) {
+  var S = LINKS + 1, rootX = t.px[0], rootY = t.py[0], r, j;
+  c.beginPath(); c.moveTo(rootX, rootY);
+  for (j = 1; j <= LINKS; j++) c.lineTo(t.px[j], t.py[j]);
+  for (r = 0; r < RAYS - 1; r++) {
+    var ax = t.px[r * S + LINKS], ay = t.py[r * S + LINKS], cx = t.px[(r + 1) * S + LINKS], cy = t.py[(r + 1) * S + LINKS], mx = (ax + cx) * 0.5, my = (ay + cy) * 0.5;
+    c.quadraticCurveTo(mx + (mx - rootX) * 0.10, my + (my - rootY) * 0.10, cx, cy);
+  }
+  for (j = LINKS - 1; j >= 1; j--) c.lineTo(t.px[(RAYS - 1) * S + j], t.py[(RAYS - 1) * S + j]);
+  c.closePath();
+}
+function emitVeins(c, t) {
+  var S = LINKS + 1;
+  c.beginPath();
+  for (var r = 0; r < RAYS; r++) { c.moveTo(t.px[0], t.py[0]); for (var j = 1; j <= LINKS; j++) c.lineTo(t.px[r * S + j], t.py[r * S + j]); }
+}
+function causticLayer(pat, scale, rotRad, ox, oy, alpha) {
+  ctx.save(); ctx.globalAlpha = alpha; ctx.rotate(rotRad); ctx.scale(scale, scale); ctx.translate(ox, oy);
+  ctx.fillStyle = pat; var ext = (W + H) * 1.6 / scale; ctx.fillRect(-ext, -ext, ext * 2, ext * 2); ctx.restore();
+}
+function drawBackdrop() {
+  var key = loveMode ? 'love' : 'pond';
+  if (!backdrops[key]) backdrops[key] = buildBackdrop(loveMode);
+  ctx.drawImage(backdrops[key], 0, 0, W, H);
+  var s1 = unit * 0.55 / 160, pat = causticPattern[key];
+  causticLayer(pat, s1, 8 * PI / 180, (time * 8) % 160, (time * 4.5) % 160, 0.298);
+  causticLayer(pat, s1 * 0.68, -17 * PI / 180, (-time * 6) % 160, (time * 7.5) % 160, 0.196);
+  ctx.fillStyle = beamGrad[key];
+  for (var i = 0; i < 4; i++) {
+    var cx = W * (0.12 + 0.24 * i) + Math.sin(time * 0.15 + i * 1.7) * W * 0.05, topW = W * 0.045 * (1 + 0.4 * Math.sin(time * 0.3 + i)), botW = W * 0.15, shift = H * 0.22;
+    ctx.globalAlpha = (120 + 100 * (0.5 + 0.5 * Math.sin(time * 0.4 + i * 2.1))) / 255;
+    ctx.beginPath(); ctx.moveTo(cx - topW, 0); ctx.lineTo(cx + topW, 0); ctx.lineTo(cx + shift + botW, H * 0.85); ctx.lineTo(cx + shift - botW, H * 0.85); ctx.closePath(); ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  ctx.drawImage(overlay, 0, 0, W, H);
+}
+function drawBubbles() {
+  var tint = loveMode ? 0xFFD0E8 : 0xCFF4FF;
+  ctx.lineWidth = dens * 0.9;
+  for (var i = 0; i < MAX_BUBBLES; i++) {
+    var b = bubbles[i];
+    ctx.beginPath(); ctx.arc(b.x, b.y, b.r, 0, TAU); ctx.fillStyle = col(tint, 16); ctx.fill(); ctx.strokeStyle = col(tint, 80); ctx.stroke();
+    ctx.beginPath(); ctx.arc(b.x - b.r * 0.35, b.y - b.r * 0.38, Math.max(0.8, b.r * 0.2), 0, TAU); ctx.fillStyle = col(0xFFFFFF, 130); ctx.fill();
+  }
+}
+function drawShadow(f) {
+  var ox = f.len * 0.13, oy = f.len * 0.20;
+  ctx.lineJoin = 'round';
+  ctx.lineWidth = f.len * 0.11; ctx.strokeStyle = 'rgba(0,0,18,0.063)'; emitRibbon(ctx, f.bodyX, f.bodyY, f.bodyM, ox, oy); ctx.stroke();
+  ctx.fillStyle = 'rgba(0,0,18,0.19)'; ctx.fill();
+  ctx.save(); ctx.translate(ox, oy); ctx.fillStyle = 'rgba(0,0,18,0.11)'; emitTail(ctx, f.tailA); ctx.fill(); ctx.restore();
+}
+function drawFin(f, j, side, lat, ang, length, flut, p, alphaMul) {
+  var bx = -f.dx[j], by = -f.dy[j], sx = -f.dy[j] * side, sy = f.dx[j] * side, hwj = f.hw[j];
+  var rx = f.rx[j] + sx * hwj * lat, ry = f.ry[j] + sy * hwj * lat, a0 = ang - 0.46, a2 = ang + 0.42, ka = ang - 0.23, kb = ang + 0.21;
+  var e0x = rx + (bx * Math.cos(a0) + sx * Math.sin(a0)) * length * 0.80, e0y = ry + (by * Math.cos(a0) + sy * Math.sin(a0)) * length * 0.80;
+  var d1x = bx * Math.cos(ang) + sx * Math.sin(ang), d1y = by * Math.cos(ang) + sy * Math.sin(ang), fluttr = Math.sin(flut) * length * 0.10;
+  var e1x = rx + d1x * length - d1y * fluttr, e1y = ry + d1y * length + d1x * fluttr;
+  var e2x = rx + (bx * Math.cos(a2) + sx * Math.sin(a2)) * length * 0.84, e2y = ry + (by * Math.cos(a2) + sy * Math.sin(a2)) * length * 0.84;
+  var k0x = rx + (bx * Math.cos(ka) + sx * Math.sin(ka)) * length * 1.05, k0y = ry + (by * Math.cos(ka) + sy * Math.sin(ka)) * length * 1.05;
+  var k1x = rx + (bx * Math.cos(kb) + sx * Math.sin(kb)) * length * 1.05, k1y = ry + (by * Math.cos(kb) + sy * Math.sin(kb)) * length * 1.05;
+  ctx.beginPath(); ctx.moveTo(rx, ry); ctx.lineTo(e0x, e0y); ctx.quadraticCurveTo(k0x, k0y, e1x, e1y); ctx.quadraticCurveTo(k1x, k1y, e2x, e2y); ctx.closePath();
+  ctx.fillStyle = col(FIN2[p], Math.floor(128 * alphaMul)); ctx.fill();
+  ctx.lineWidth = dens * 0.8; ctx.strokeStyle = col(FIN[p], 96);
+  ctx.beginPath();
+  ctx.moveTo(rx, ry); ctx.lineTo(e0x, e0y); ctx.moveTo(rx, ry); ctx.lineTo((e0x + e1x) * 0.5, (e0y + e1y) * 0.5);
+  ctx.moveTo(rx, ry); ctx.lineTo(e1x, e1y); ctx.moveTo(rx, ry); ctx.lineTo((e1x + e2x) * 0.5, (e1y + e2y) * 0.5); ctx.moveTo(rx, ry); ctx.lineTo(e2x, e2y);
+  ctx.stroke();
+}
+function drawFish(f) {
+  var p = f.palette, len = f.len, i, k, s;
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  /* double-veil tail */
+  emitTail(ctx, f.tailA); ctx.fillStyle = col(FIN2[p], 92); ctx.fill();
+  emitTail(ctx, f.tailB); ctx.fillStyle = col(FIN[p], 112); ctx.fill();
+  ctx.lineWidth = dens * 0.9; ctx.strokeStyle = col(FIN[p], 80); emitVeins(ctx, f.tailA); ctx.stroke();
+  ctx.strokeStyle = col(EDGE[p], 70); emitVeins(ctx, f.tailB); ctx.stroke();
+  ctx.lineWidth = dens * 1.2; ctx.strokeStyle = col(0xFFFFFF, 34); emitTail(ctx, f.tailA); ctx.stroke();
+  /* pelvic fins */
+  var pelBase = 0.78 - 0.18 * Math.min(1, f.sn);
+  drawFin(f, 4, 1, 0.70, pelBase + 0.30 * Math.sin(f.pelPhaseL), len * 0.15, f.pelPhaseL + 1, p, 0.9);
+  drawFin(f, 4, -1, 0.70, pelBase + 0.30 * Math.sin(f.pelPhaseR), len * 0.15, f.pelPhaseR + 2, p, 0.9);
+  /* body: dark rim, then 3D shaded discs (pre-rendered radial sprite) tail to head */
+  emitRibbon(ctx, f.bodyX, f.bodyY, f.bodyM, 0, 0); ctx.fillStyle = col(EDGE[p], 255); ctx.fill();
+  var spr = bodySprite[p];
+  for (k = (N - 1) * 3; k >= 0; k--) {
+    var u = k / 3, ii = Math.floor(u);
+    if (ii >= N - 1) ii = N - 2;
+    var t = u - ii, cx = f.rx[ii] + (f.rx[ii + 1] - f.rx[ii]) * t, cy = f.ry[ii] + (f.ry[ii + 1] - f.ry[ii]) * t, r = (f.hw[ii] + (f.hw[ii + 1] - f.hw[ii]) * t) * 0.94;
+    ctx.drawImage(spr, cx - r, cy - r, r * 2, r * 2);
+  }
+  for (var b = 0; b < f.blotches; b++) {
+    var ub = f.bj[b], ib = Math.floor(ub);
+    if (ib >= N - 1) ib = N - 2;
+    var tb = ub - ib, hwHere = f.hw[ib] + (f.hw[ib + 1] - f.hw[ib]) * tb, rad = f.bs[b] * hwHere;
+    var bx = f.rx[ib] + (f.rx[ib + 1] - f.rx[ib]) * tb - f.dy[ib] * f.bo[b] * hwHere, by = f.ry[ib] + (f.ry[ib + 1] - f.ry[ib]) * tb + f.dx[ib] * f.bo[b] * hwHere;
+    ctx.globalAlpha = 225 / 255; ctx.drawImage(blotchSprite[f.bc[b] === 1 ? 1 : 0], bx - rad, by - rad, rad * 2, rad * 2); ctx.globalAlpha = 1;
+  }
+  /* scale crescents */
+  ctx.lineWidth = dens * 0.9; ctx.strokeStyle = col(EDGE[p], 44); ctx.beginPath();
+  for (i = 2; i <= 8; i++) {
+    var hwI = f.hw[i], rs = Math.min(len / (N - 1) * 0.62, hwI * 0.40), cnt = (i & 1) === 0 ? 3 : 2, back = Math.atan2(-f.dy[i], -f.dx[i]), a0 = back - 68 * PI / 180;
+    for (s = 0; s < cnt; s++) {
+      var off = cnt === 3 ? (s - 1) * 0.58 : (s - 0.5) * 0.58, ccx = f.rx[i] - f.dy[i] * off * hwI, ccy = f.ry[i] + f.dx[i] * off * hwI;
+      ctx.moveTo(ccx + Math.cos(a0) * rs, ccy + Math.sin(a0) * rs); ctx.arc(ccx, ccy, rs, a0, back + 68 * PI / 180);
+    }
+  }
+  ctx.stroke();
+  /* specular lens + head catch-light */
+  emitRibbon(ctx, f.spX, f.spY, f.spM, 0, 0); ctx.fillStyle = col(0xFFFFFF, 88); ctx.fill();
+  ctx.beginPath(); ctx.arc(f.rx[2] - 0.30 * f.hw[2], f.ry[2] - 0.42 * f.hw[2], f.hw[2] * 0.13, 0, TAU); ctx.fillStyle = col(0xFFFFFF, 170); ctx.fill();
+  /* gill cover */
+  var nx2 = -f.dy[2], ny2 = f.dx[2], gx = f.rx[3] + (f.rx[3] - f.rx[2]) * 0.4, gy = f.ry[3] + (f.ry[3] - f.ry[2]) * 0.4;
+  ctx.beginPath(); ctx.moveTo(f.rx[2] + nx2 * f.hw[2] * 0.88, f.ry[2] + ny2 * f.hw[2] * 0.88); ctx.quadraticCurveTo(gx, gy, f.rx[2] - nx2 * f.hw[2] * 0.88, f.ry[2] - ny2 * f.hw[2] * 0.88);
+  ctx.lineWidth = dens * 1.2; ctx.strokeStyle = col(EDGE[p], 78); ctx.stroke();
+  /* dorsal crest */
+  emitRibbon(ctx, f.dorX, f.dorY, f.dorM, 0, 0); ctx.fillStyle = col(FIN2[p], 125); ctx.fill(); ctx.lineWidth = dens * 0.8; ctx.strokeStyle = col(FIN[p], 150); ctx.stroke();
+  /* pectoral fins */
+  var pecBase = 1.02 - 0.42 * Math.min(1, f.sn);
+  drawFin(f, 2, 1, 0.92, pecBase + 0.40 * Math.sin(f.pecPhaseL), len * 0.21, f.pecPhaseL + 0.6, p, 1);
+  drawFin(f, 2, -1, 0.92, pecBase + 0.40 * Math.sin(f.pecPhaseR), len * 0.21, f.pecPhaseR + 1.7, p, 1);
+  /* eyes */
+  for (s = -1; s <= 1; s += 2) {
+    var ex = f.rx[1] - f.dy[1] * s * f.hw[1] * 0.80, ey = f.ry[1] + f.dx[1] * s * f.hw[1] * 0.80, er = f.hw[1] * 0.24 * 1.35;
+    ctx.drawImage(eyeSprite[p], ex - er, ey - er, er * 2, er * 2);
+  }
+}
+function drawPellets() {
+  var r = unit * 0.0085;
+  for (var i = 0; i < MAX_PELLETS; i++) {
+    var p = pellets[i];
+    if (!p.on) continue;
+    var a = Math.min(1, p.life / 1.5);
+    ctx.beginPath(); ctx.arc(p.x + r * 0.9, p.y + r * 1.3, r, 0, TAU); ctx.fillStyle = col(0x000010, Math.floor(46 * a)); ctx.fill();
+    ctx.globalAlpha = a; ctx.drawImage(pelletSprite, p.x - r, p.y - r, r * 2, r * 2); ctx.globalAlpha = 1;
+  }
+}
+function drawRipples() {
+  var ring = loveMode ? 0xFFD6EC : 0xCFF7FF, spark = loveMode ? 0xFFF0F6 : 0xEFFFFF;
+  for (var i = 0; i < MAX_RIPPLES; i++) {
+    var r = ripples[i];
+    if (!r.active || r.age < 0) continue;
+    var t = r.age / r.life, e = 1 - (1 - t) * (1 - t), rad = r.maxR * e;
+    if (rad < 1) continue;
+    var a = (1 - t) * (1 - t);
+    ctx.lineWidth = dens * (2.6 - 1.4 * t); ctx.strokeStyle = col(ring, Math.floor(235 * a)); ctx.beginPath(); ctx.arc(r.x, r.y, rad, 0, TAU); ctx.stroke();
+    ctx.lineWidth = dens * 1.3; ctx.strokeStyle = col(ring, Math.floor(150 * a)); ctx.beginPath(); ctx.arc(r.x, r.y, rad * 0.78, 0, TAU); ctx.stroke();
+    ctx.strokeStyle = col(ring, Math.floor(80 * a)); ctx.beginPath(); ctx.arc(r.x, r.y, rad * 0.56, 0, TAU); ctx.stroke();
+    for (var k = 0; k < 6; k++) {
+      var an = k * TAU / 6 + r.age * 1.6, tw = Math.sin(r.age * 9 + k * 2);
+      ctx.fillStyle = col(spark, Math.floor(255 * a * (0.35 + 0.65 * tw * tw)));
+      ctx.beginPath(); ctx.arc(r.x + Math.cos(an) * rad, r.y + Math.sin(an) * rad, dens * (1.2 + 1.2 * a), 0, TAU); ctx.fill();
+    }
+  }
+}
+function render() {
+  drawBackdrop(); drawBubbles();
+  var i;
+  for (i = 0; i < FISH_COUNT; i++) drawShadow(fish[i]);
+  for (i = 0; i < FISH_COUNT; i++) drawFish(fish[i]);
+  drawPellets(); drawRipples();
+}
+
+/* ---------- interaction: ripples and fish only ---------- */
+var touching = false, touchX = 0, touchY = 0, lastEmitX = 0, lastEmitY = 0, lastTapT = 0, lastTapX = 0, lastTapY = 0, activePointer = -1;
+function touchDown(x, y) {
+  touching = true; touchX = x; touchY = y; lastEmitX = x; lastEmitY = y;
+  startRipple(x, y, unit * 0.26, 1.7, 0); startRipple(x, y, unit * 0.17, 1.3, -0.18);
+  scare(x, y);
+  for (var i = 0; i < FISH_COUNT; i++) {                      // curious fish drift over to look
+    var f = fish[i], dx = f.x - x, dy = f.y - y, far = f.len * 3.2;
+    if (f.dart <= 0 && f.attractT <= 0 && dx * dx + dy * dy < far * far) { f.attractT = rand(3, 5); f.attractX = x; f.attractY = y; }
+  }
+}
+function touchMove(x, y) {
+  touchX = x; touchY = y;
+  var dx = x - lastEmitX, dy = y - lastEmitY, step = unit * 0.045;
+  if (dx * dx + dy * dy > step * step) { startRipple(x, y, unit * 0.15, 1.1, 0); lastEmitX = x; lastEmitY = y; }
+  scare(x, y);
+}
+function feed(x, y) {
+  startRipple(x, y, unit * 0.20, 1.4, 0);
+  var dropped = 0;
+  for (var i = 0; i < MAX_PELLETS; i++) {
+    var p = pellets[i];
+    if (p.on) continue;
+    var a = rand(0, TAU), r = Math.sqrt(rnd()) * unit * 0.07;
+    p.on = true; p.x = x + Math.cos(a) * r; p.y = y + Math.sin(a) * r; p.vy = unit * rand(0.022, 0.040); p.phase = rand(0, TAU); p.life = rand(13, 18);
+    if (++dropped >= 9) break;
+  }
+}
+canvas.addEventListener('pointerdown', function (e) {
+  if (activePointer !== -1) return;
+  activePointer = e.pointerId;
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+  var now = performance.now(), x = e.clientX, y = e.clientY, dx = x - lastTapX, dy = y - lastTapY;
+  if (now - lastTapT < 360 && dx * dx + dy * dy < unit * unit * 0.02) { feed(x, y); lastTapT = 0; }
+  else { lastTapT = now; lastTapX = x; lastTapY = y; touchDown(x, y); }
+  e.preventDefault();
+});
+canvas.addEventListener('pointermove', function (e) { if (e.pointerId === activePointer) touchMove(e.clientX, e.clientY); });
+function endPointer(e) { if (e.pointerId === activePointer) { activePointer = -1; touching = false; } }
+canvas.addEventListener('pointerup', endPointer); canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+
+/* ---------- HUD / Android bridge ---------- */
+var bridge = window.Android && typeof window.Android.applyLiveWallpaper === 'function' ? window.Android : null;
+var toastEl = document.getElementById('toast'), toastTimer = 0, seg = document.getElementById('seg');
+function toast(msg) { toastEl.textContent = msg; toastEl.classList.add('show'); clearTimeout(toastTimer); toastTimer = setTimeout(function () { toastEl.classList.remove('show'); }, 2800); }
+function setMode(mode, persist) {
+  loveMode = mode !== 'pond';
+  document.body.setAttribute('data-mode', loveMode ? 'love' : 'pond');
+  var btns = seg.querySelectorAll('button');
+  for (var i = 0; i < btns.length; i++) btns[i].setAttribute('aria-pressed', String((btns[i].getAttribute('data-mode') === 'love') === loveMode));
+  for (i = 0; i < FISH_COUNT; i++) pickTarget(fish[i]);
+  for (i = 0; i < pairs.length; i++) { var a = fish[2 * i], b = fish[2 * i + 1]; pairs[i].cx = (a.x + b.x) * 0.5; pairs[i].cy = (a.y + b.y) * 0.5; pairs[i].ang = a.ang; pickPairTarget(pairs[i]); }
+  if (persist && bridge && typeof bridge.saveMode === 'function') bridge.saveMode(loveMode ? 'love' : 'pond');
+}
+seg.addEventListener('click', function (e) { var b = e.target.closest('button'); if (b) setMode(b.getAttribute('data-mode'), true); });
+document.getElementById('feed').addEventListener('click', function () { feed(W * rand(0.3, 0.7), H * rand(0.16, 0.30)); });
+document.getElementById('set').addEventListener('click', function () {
+  if (bridge) bridge.applyLiveWallpaper(loveMode ? 'love' : 'pond');
+  else toast('Open this page inside the Android app to set the wallpaper.');
+});
+
+/* ---------- sizing: DPR clamped to 2, adaptive render scale ---------- */
+function applyScale() {
+  CW = Math.max(2, Math.round(W * DPR * quality)); CH = Math.max(2, Math.round(H * DPR * quality));
+  canvas.width = CW; canvas.height = CH;
+  ctx.setTransform(CW / W, 0, 0, CH / H, 0, 0);
+}
+function resize() {
+  W = Math.max(1, window.innerWidth); H = Math.max(1, window.innerHeight); unit = Math.min(W, H); dens = Math.max(0.75, unit / 360);
+  DPR = Math.min(window.devicePixelRatio || 1, 2.0);
+  applyScale();
+  backdrops.love = backdrops.pond = null;
+  causticPattern.love = buildCausticPattern(true); causticPattern.pond = buildCausticPattern(false);
+  var h0 = CH0();
+  beamGrad = { love: null, pond: null };
+  [['love', [0x34FFD6EC, 0x00FFD6EC]], ['pond', [0x30D2FFFF, 0x00D2FFFF]]].forEach(function (e) {
+    var g = ctx.createLinearGradient(0, 0, 0, H * 0.85); g.addColorStop(0, css(e[1][0])); g.addColorStop(1, css(e[1][1])); beamGrad[e[0]] = g;
+  });
+  overlay = buildOverlay();
+  backdrops[loveMode ? 'love' : 'pond'] = buildBackdrop(loveMode);
+  initFish(); initBubbles();
+  for (var i = 0; i < MAX_PELLETS; i++) pellets[i].on = false;
+  for (i = 0; i < MAX_RIPPLES; i++) ripples[i].active = false;
+  void h0;
+  setTimeout(function () { var k = loveMode ? 'pond' : 'love'; if (!backdrops[k]) backdrops[k] = buildBackdrop(!loveMode); }, 400);
+}
+var resizeTimer = 0;
+window.addEventListener('resize', function () { clearTimeout(resizeTimer); resizeTimer = setTimeout(resize, 150); });
+
+/* ---------- loop ---------- */
+var lastT = 0, lastDraw = 0, workEma = 8, slow = 0, raf = 0;
+function frame(t) {
+  raf = requestAnimationFrame(frame);
+  if (t - lastDraw < 15) return;                                  // cap at ~60 FPS (45 on 90 Hz, 60 on 120 Hz)
+  var dt = lastT ? Math.min(0.033, (t - lastT) / 1000) : 1 / 60;  // real elapsed time, clamped
+  lastT = t; lastDraw = t;
+  var w0 = performance.now();
+  update(dt, dt * 60);                                            // dtScale = dt * 60: identical speed at any refresh rate
+  render();
+  workEma += (performance.now() - w0 - workEma) * 0.05;
+  if (workEma > 20) { if (++slow > 120 && quality > 0.6) { quality = Math.max(0.6, quality * 0.88); applyScale(); slow = 0; } } else slow = Math.max(0, slow - 2);
+}
+document.addEventListener('visibilitychange', function () {
+  if (document.hidden) { cancelAnimationFrame(raf); } else { lastT = 0; raf = requestAnimationFrame(frame); }
+});
+
+if (bridge && typeof bridge.getMode === 'function') loveMode = bridge.getMode() !== 'pond';
+resize();
+setMode(loveMode ? 'love' : 'pond', false);
+raf = requestAnimationFrame(frame);
+window.__aquarium = { step: function (s) { for (var i = 0; i < Math.round(s * 60); i++) update(1 / 60, 1); render(); }, touchDown: touchDown, touchMove: touchMove, feed: feed, setMode: function (m) { setMode(m, false); } };
+})();
+</script>
+</body>
+</html>

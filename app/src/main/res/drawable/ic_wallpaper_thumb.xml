@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Portrait thumbnail shown by the system live wallpaper picker (required by Realme UI / ColorOS / OPPO). -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="180dp"
+    android:height="320dp"
+    android:viewportWidth="180"
+    android:viewportHeight="320">
+    <path android:fillColor="#33124F" android:pathData="M0,0h180v320h-180z" />
+    <path android:fillColor="#5E2060" android:pathData="M0,120C40,100 90,140 180,110L180,320L0,320Z" />
+    <path android:fillColor="#8C3A6B" android:pathData="M0,230C50,215 110,245 180,225L180,320L0,320Z" />
+    <path android:fillColor="#B5798F" android:fillAlpha="0.85" android:pathData="M18,270C18,258 40,254 52,262C60,268 56,282 40,284C26,286 18,280 18,270Z" />
+    <path android:fillColor="#8E6AA8" android:fillAlpha="0.85" android:pathData="M120,282C122,270 146,268 158,276C164,284 154,298 138,298C126,298 119,292 120,282Z" />
+    <path android:fillColor="#D9B5C4" android:fillAlpha="0.8" android:pathData="M80,300C82,294 96,292 102,298C104,304 96,308 88,308C82,308 79,304 80,300Z" />
+    <path android:fillColor="#FFC870" android:fillAlpha="0.7" android:pathData="M96,96C112,80 134,66 150,70C142,84 140,96 144,106C140,116 142,128 150,140C134,142 112,128 96,112Z" />
+    <path android:fillColor="#FF8A00" android:pathData="M44,106C56,80 98,74 118,106C98,138 56,132 44,106Z" />
+    <path android:fillColor="#FFE9A8" android:fillAlpha="0.7" android:pathData="M56,98C68,88 90,86 102,94C88,92 70,94 56,98Z" />
+    <path android:fillColor="#140A10" android:pathData="M58,100m-4,0a4,4 0,1 1,8 0a4,4 0,1 1,-8 0" />
+    <path android:fillColor="#FFFFFF" android:fillAlpha="0.9" android:pathData="M120,190C128,176 140,170 148,172C144,182 143,190 145,196C143,204 144,212 148,220C140,222 128,210 120,200Z" />
+    <path android:fillColor="#FFFFFF" android:pathData="M82,196C92,176 120,172 136,196C120,218 92,216 82,196Z" />
+    <path android:fillColor="#DE1C1C" android:pathData="M92,192C96,184 108,184 112,192C108,200 96,200 92,192Z" />
+</vector>

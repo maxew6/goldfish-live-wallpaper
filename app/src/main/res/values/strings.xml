@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Goldfish Live Wallpaper</string>
+    <string name="wallpaper_description">Realistic goldfish swimming in a Love Aquarium or a Natural Pond. Tap or drag for water ripples; double-tap to feed the fish.</string>
+    <string name="pick_goldfish_hint">Choose "Goldfish Live Wallpaper" from the list, then tap Set wallpaper.</string>
+    <string name="no_picker">Could not open the wallpaper picker. Open Settings, then Wallpaper, then Live wallpapers, and choose Goldfish Live Wallpaper.</string>
+</resources>
